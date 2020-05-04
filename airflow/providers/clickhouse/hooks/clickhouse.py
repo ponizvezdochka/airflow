@@ -174,7 +174,6 @@ class ClickhouseHook(BaseHook):
             self.log.warning('%s Error quering clickhouse', ex)
             raise AirflowException(ex)
 
-
     def insert_rows(self, sql=None, table=None, endpoint=None, data=None, row_format=None, **request_kwargs):
         """
         A generic way to insert rows from input stream or values from query into a table.
@@ -202,7 +201,6 @@ class ClickhouseHook(BaseHook):
 
         self.log.info("Insert query: %s", query)
         return self.run(sql=query, endpoint=endpoint, row_format=row_format, data=data, **request_kwargs)
-
 
     def get_records(self, sql, endpoint=None, row_format=None, **request_kwargs):
         """
