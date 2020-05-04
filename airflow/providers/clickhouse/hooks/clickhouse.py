@@ -21,9 +21,8 @@ import requests
 from requests.auth import HTTPBasicAuth
 from requests_kerberos import HTTPKerberosAuth, DISABLED
 
-from airflow.configuration import conf
-from airflow.providers.http.hooks.http import HttpHook
-from airflow.security import utils
+from airflow.exceptions import AirflowException
+from airflow.hooks.base_hook import BaseHook
 
 
 class ClickhouseException(Exception):
@@ -32,37 +31,66 @@ class ClickhouseException(Exception):
     """
 
 
-class ClickhouseHook(HttpHook):
+class ClickhouseFormat:
+    """
+    Helper class with supported formats.
+    """
+    TABSEPARATED = "TabSeparated"
+    TABSEPARATEDRAW = "TabSeparatedRaw"
+    TABSEPARATEDWITHNAMES = "TabSeparatedWithNames"
+    TABSEPARATEDWITHNAMESANDTYPES = "TabSeparatedWithNamesAndTypes"
+    TEMPLATE = "Template"
+    TEMPLATEIGNORESPACES = "TemplateIgnoreSpaces"
+    CSV = "CSV"
+    CSVWITHNAMES = "CSVWithNames"
+    CUSTOMSEPARATED = "CustomSeparated"
+    VALUES = "Values"
+    VERTICAL = "Vertical"
+    JSON = "JSON"
+    JSONCOMPACT = "JSONCompact"
+    JSONEACHROW = "JSONEachRow"
+    TSKV = "TSKV"
+    PRETTY = "Pretty"
+    PRETTYCOMPACT = "PrettyCompact"
+    PRETTYCOMPACTMONOBLOCK = "PrettyCompactMonoBlock"
+    PRETTYNOESCAPES = "PrettyNoEscapes"
+    PRETTYSPACE = "PrettySpace"
+    PROTOBUF = "Protobuf"
+    PARQUET = "Parquet"
+    ORC = "ORC"
+    ROWBINARY = "RowBinary"
+    ROWBINARYWITHNAMESANDTYPES = "RowBinaryWithNamesAndTypes"
+    NATIVE = "Native"
+    NULL = "Null"
+    XML = "XML"
+    CAPNPROTO = "CapnProto"
+
+
+class ClickhouseHook(BaseHook):
     """
     Interact with Clickhouse.
     """
 
-    conn_name_attr = 'clickhouse_conn_id'
-    default_conn_name = 'clickhouse_default'
+    def __init__(self, clickhouse_conn_id='clickhouse_default'):
+        self.clickhouse_conn_id = clickhouse_conn_id
+        self.base_url = None
+        self.auth = None
+        self.get_conn()
 
-    def __init__(self,
-                 clickhouse_conn_id='clickhouse_default',
-                 *args,
-                 **kwargs
-                 ):
-        super(ClickhouseHook).__init__(method='POST', http_conn_id=clickhouse_conn_id, *args, **kwargs)
-
-    def get_conn(self, headers=None):
+    # headers may be passed through directly or in the "extra" field in the connection
+    # definition
+    def get_conn(self):
         """
-        Returns http session for use with requests
-
-        :param headers: additional headers to be passed through as a dictionary
-        :type headers: dict
+        Sets authentification object for use with requests
         """
-        session = requests.Session()
 
         if self.clickhouse_conn_id:
             conn = self.get_connection(self.clickhouse_conn_id)
 
             if conn.extra_dejson.get('kerberos'):
-                session.auth = HTTPKerberosAuth(DISABLED)
+                self.auth = HTTPKerberosAuth(DISABLED)
             elif conn.password:
-                session.auth = HTTPBasicAuth(conn.login, conn.password)
+                self.auth = HTTPBasicAuth(conn.login, conn.password)
 
             if conn.host and "://" in conn.host:
                 self.base_url = conn.host
@@ -74,90 +102,120 @@ class ClickhouseHook(HttpHook):
 
             if conn.port:
                 self.base_url = self.base_url + ":" + str(conn.port)
-            if conn.extra:
-                try:
-                    session.headers.update(conn.extra_dejson)
-                except TypeError:
-                    self.log.warning('Connection to %s has invalid extra field.', conn.host)
-        if headers:
-            session.headers.update(headers)
 
-        return session
+        return self.auth
 
     @staticmethod
     def _strip_sql(sql):
         return sql.strip().rstrip(';')
 
-    def run(self, sql, extra_options=None, **request_kwargs):
+    def _concat_url_w_endpoint(self, endpoint=None):
+        if self.base_url and not self.base_url.endswith('/') and \
+           endpoint and not endpoint.startswith('/'):
+            url = self.base_url + '/' + endpoint
+        else:
+            url = (self.base_url or '') + (endpoint or '')
+        return url
+
+    def _check_response(self, response):
         """
-        Execute the statement against Clickhouse. Can be used to set parameters.
+        Checks the status code and raise an AirflowException exception on non 2XX or 3XX
+        status codes
+
+        :param response: A requests response object
+        :type response: requests.response
+        """
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError:
+            self.log.error("HTTP error: %s", response.reason)
+            self.log.error(response.text)
+            raise AirflowException(str(response.status_code) + ":" + response.reason)
+
+    def run(self, sql, endpoint=None, row_format=None, data=None, **request_kwargs):
+        """
+        Execute sql statement against Clickhouse.
 
         :param sql: the sql code to be executed. (templated)
-        :type sql: Can receive a str representing a sql statement,
-            a list of str (sql statements), or reference to a template file.
-            Template reference are recognized by str ending in '.sql'
-        :param data: payload to be uploaded or request parameters
-        :type data: dict
-        :param extra_options: additional options to be used when executing the request
-            i.e. {'check_response': False} to avoid checking raising exceptions on non
-            2XX or 3XX status codes
-        :type extra_options: dict
+        :type sql: str
+        :param endpoint: the endpoint to be called i.e. resource/v1/query?
+        :type endpoint: str
+        :param row_format: Input format
+        :type row_format: str
+        :param data: data to pass through request body
+        :type data: dict or str or iterable
         :param  \**request_kwargs: Additional kwargs to pass when creating a request.
             For example, ``run(json=obj)`` is passed as ``requests.Request(json=obj)``
         """
-        self.log.info("Starting query: %s", sql)
-        data = self._strip_sql(sql),
-        return super(ClickhouseHook).run(endpoint=None, data=data, extra_options=extra_options, **request_kwargs)
-
-    def get_records(self, sql, format=None, extra_options=None, **request_kwargs):
-        """
-        Get a set of records from Clickhouse
-
-        :param sql: the sql code to be executed. (templated)
-        :type sql: Can receive a str representing a sql statement,
-            a list of str (sql statements), or reference to a template file.
-            Template reference are recognized by str ending in '.sql'
-        :param format: Input format
-        :type format: str
-        :param data: payload to be uploaded or request parameters
-        :type data: dict
-        :param extra_options: additional options to be used when executing the request
-            i.e. {'check_response': False} to avoid checking raising exceptions on non
-            2XX or 3XX status codes
-        :type extra_options: dict
-        :param  \**request_kwargs: Additional kwargs to pass when creating a request.
-            For example, ``run(json=obj)`` is passed as ``requests.Request(json=obj)``
-        """
+        url = self._concat_url_w_endpoint(endpoint)
         query = self._strip_sql(sql)
-        if format:
-            query = "%s FORMAT %s" % (query, format)
-        self.log.info("Starting query: %s", query)
-        return super(ClickhouseHook).run(endpoint=None, data=query, extra_options=extra_options, **request_kwargs)
+        if row_format:
+            query += 'FORMAT %s ' % row_format
+        self.log.info("Sending query '%s' to url: %s", sql, url)
 
-    def insert_rows(self, table, data=None, format=None, extra_options=None, **request_kwargs):
+        try:
+            response = requests.post(
+                url,
+                data=data,
+                params={'query': query},
+                stream=request_kwargs.pop("stream", False),
+                verify=request_kwargs.pop("verify", True),
+                proxies=request_kwargs.pop("proxies", {}),
+                cert=request_kwargs.pop("cert", None),
+                timeout=request_kwargs.pop("timeout", 10),
+                allow_redirects=request_kwargs.pop("allow_redirects", True),
+                auth=self.auth,
+                **request_kwargs)
+
+            self._check_response(response)
+            return response
+
+        except requests.exceptions.ConnectionError as ex:
+            self.log.warning('%s Error quering clickhouse', ex)
+            raise AirflowException(ex)
+
+
+    def insert_rows(self, sql=None, table=None, endpoint=None, data=None, row_format=None, **request_kwargs):
         """
-        A generic way to insert rows from input stream into a table.
+        A generic way to insert rows from input stream or values from query into a table.
 
+        :param sql: the sql code with values to insert. (templated)
+        :type sql: str
         :param table: Name of the target table
         :type table: str
+        :param endpoint: the endpoint to be called i.e. resource/v1/query?
+        :type endpoint: str
         :param data: The rows to insert into the table
         :type data: iterable of str
-        :param format: Input format
-        :type format: str
-        :param data: payload to be uploaded or request parameters
-        :type data: dict
-        :param extra_options: additional options to be used when executing the request
-            i.e. {'check_response': False} to avoid checking raising exceptions on non
-            2XX or 3XX status codes
-        :type extra_options: dict
+        :param row_format: Input format
+        :type row_format: str
         :param  \**request_kwargs: Additional kwargs to pass when creating a request.
             For example, ``run(json=obj)`` is passed as ``requests.Request(json=obj)``
         """
-        query = "INSERT INTO %s " % table
-        if format:
-            query += 'FORMAT %s ' % format
-        self.log.info("Starting insert: %s", query)
-        if data:
-            return super(ClickhouseHook).run(endpoint=None, data=data, extra_options=extra_options, params={'query': query}, **request_kwargs)
-        else:  # insert values
-            return super(ClickhouseHook).run(endpoint=None, data=query, extra_options=extra_options, **request_kwargs)
+        if sql:
+            query = self._strip_sql(sql)
+        elif table:
+            query = "INSERT INTO %s " % table
+        else:
+            self.log.error("Neither sql nor table name is specified.")
+            raise AirflowException("Insert failed.")
+
+        self.log.info("Insert query: %s", query)
+        return self.run(sql=query, endpoint=endpoint, row_format=row_format, data=data, **request_kwargs)
+
+
+    def get_records(self, sql, endpoint=None, row_format=None, **request_kwargs):
+        """
+        A generic way to get records from Clickhouse.
+
+        :param sql: the sql code to retrieve records. (templated)
+        :type sql: str
+        :param endpoint: the endpoint to be called i.e. resource/v1/query?
+        :type endpoint: str
+        :param row_format: Input format
+        :type row_format: str
+        :param  \**request_kwargs: Additional kwargs to pass when creating a request.
+            For example, ``run(json=obj)`` is passed as ``requests.Request(json=obj)``
+        """
+        self.log.info("Select query: %s", sql)
+        return self.run(sql=sql, endpoint=endpoint, row_format=row_format, **request_kwargs)

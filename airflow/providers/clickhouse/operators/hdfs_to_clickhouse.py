@@ -17,12 +17,12 @@
 # under the License.
 #
 
-from typing import List, Union, Optional
+from typing import List, Union, Optional, Dict, Any
 
 from airflow.exceptions import AirflowException
 from airflow.models import BaseOperator
 from airflow.providers.apache.hdfs.hooks.hdfs import HDFSHook, HDFSHookException
-from airflow.providers.clickhouse.hooks.clickhouse import ClickhouseHook, ClickhouseException
+from airflow.providers.clickhouse.hooks.clickhouse import ClickhouseHook, ClickhouseFormat, ClickhouseException
 from airflow.utils.decorators import apply_defaults
 
 
@@ -56,7 +56,7 @@ class HdfsToClickhouseTransfer(BaseOperator):
         clickhouse_table: str,
         hdfs_conn_id='hdfs_default',
         clickhouse_conn_id='clickhouse_default',
-        format='TabSeparated',
+        format=ClickhouseFormat.TABSEPARATED,
         extra_options: Optional[Dict[str, Any]] = None,
         *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -74,23 +74,23 @@ class HdfsToClickhouseTransfer(BaseOperator):
         :param context: The context that is being provided when executing.
         :type context: dict
         """
-        self.log.info('Loading %s to clickhouse table %s...', ','.join(self.hdfs_paths), self.clickhouse_table)
+        self.log.info("Loading %s to clickhouse table %s..." % (','.join(self.hdfs_paths), self.clickhouse_table))
 
         hdfs = HDFSHook(hdfs_conn_id=self.hdfs_conn_id)
         clickhouse = ClickhouseHook(clickhouse_conn_id=self.clickhouse_conn_id)
 
-        self.log.info('Reading from hdfs...')
+        self.log.info("Reading from hdfs...")
         try:
             hdfs_client = hdfs.get_conn()
             paths = hdfs_client.cat(self.hdfs_paths)
         except HDFSHookException as e:
-            raise AirflowException('Error reading from paths', e)
+            raise AirflowException("Error reading from paths", e)
 
-        self.log.info('Loading to clickhouse...')
+        self.log.info("Loading to clickhouse...")
         try:
             r = clickhouse.insert_rows(self.clickhouse_table, data=paths, format=self.format,
                                        extra_options=self.extra_options)
         except ClickhouseException as e:
-            raise AirflowException('Error inserting to clickhouse', e)
+            raise AirflowException("Error inserting to clickhouse", e)
         # todo count inserted rows
         self.log.info("Done")
