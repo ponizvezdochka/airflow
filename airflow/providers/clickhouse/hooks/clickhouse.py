@@ -18,11 +18,10 @@
 #
 
 import requests
-from requests.auth import HTTPBasicAuth
-from requests_kerberos import HTTPKerberosAuth, DISABLED
-
 from airflow.exceptions import AirflowException
 from airflow.hooks.base_hook import BaseHook
+from requests.auth import HTTPBasicAuth
+from requests_kerberos import HTTPKerberosAuth, DISABLED
 
 
 class ClickhouseException(Exception):
@@ -71,14 +70,12 @@ class ClickhouseHook(BaseHook):
     Interact with Clickhouse.
     """
 
-    def __init__(self, clickhouse_conn_id='clickhouse_default'):
+    def __init__(self, clickhouse_conn_id='clickhouse_default', auth=None):
         self.clickhouse_conn_id = clickhouse_conn_id
         self.base_url = None
-        self.auth = None
+        self.auth = auth
         self.get_conn()
 
-    # headers may be passed through directly or in the "extra" field in the connection
-    # definition
     def get_conn(self):
         """
         Sets authentification object for use with requests
@@ -87,8 +84,10 @@ class ClickhouseHook(BaseHook):
         if self.clickhouse_conn_id:
             conn = self.get_connection(self.clickhouse_conn_id)
 
-            if conn.extra_dejson.get('kerberos'):
-                self.auth = HTTPKerberosAuth(DISABLED)
+            if self.auth:
+                pass
+            elif conn.extra_dejson.get('kerberos'):
+                self.auth = HTTPKerberosAuth(DISABLED, force_preemptive=True)
             elif conn.password:
                 self.auth = HTTPBasicAuth(conn.login, conn.password)
 
@@ -102,8 +101,6 @@ class ClickhouseHook(BaseHook):
 
             if conn.port:
                 self.base_url = self.base_url + ":" + str(conn.port)
-
-        return self.auth
 
     @staticmethod
     def _strip_sql(sql):
@@ -148,18 +145,20 @@ class ClickhouseHook(BaseHook):
             For example, ``run(json=obj)`` is passed as ``requests.Request(json=obj)``
         """
         url = self._concat_url_w_endpoint(endpoint)
+        params = request_kwargs.pop('params', {})
         query = self._strip_sql(sql)
         if row_format:
-            query += 'FORMAT %s ' % row_format
-        self.log.info("Sending query '%s' to url: %s", sql, url)
+            query += ' FORMAT %s' % row_format
+        params['query'] = query
 
+        self.log.info("Sending query '%s' to url: %s", query, url)
         try:
             response = requests.post(
                 url,
                 data=data,
-                params={'query': query},
+                params=params,
                 stream=request_kwargs.pop("stream", False),
-                verify=request_kwargs.pop("verify", True),
+                verify=request_kwargs.pop("verify", False),
                 proxies=request_kwargs.pop("proxies", {}),
                 cert=request_kwargs.pop("cert", None),
                 timeout=request_kwargs.pop("timeout", 10),
@@ -194,12 +193,12 @@ class ClickhouseHook(BaseHook):
         if sql:
             query = self._strip_sql(sql)
         elif table:
-            query = "INSERT INTO %s " % table
+            query = "INSERT INTO %s" % table
         else:
             self.log.error("Neither sql nor table name is specified.")
             raise AirflowException("Insert failed.")
 
-        self.log.info("Insert query: %s", query)
+        self.log.info("Insert query: %s%s" % (query, ' FORMAT %s' % row_format or ''))
         return self.run(sql=query, endpoint=endpoint, row_format=row_format, data=data, **request_kwargs)
 
     def get_records(self, sql, endpoint=None, row_format=None, **request_kwargs):
